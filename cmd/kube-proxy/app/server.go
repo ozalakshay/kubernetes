@@ -495,8 +495,8 @@ func serveMetrics(ctx context.Context, bindAddress string, proxyMode kubeproxyco
 				"/healthz",
 				"/metrics",
 			),
-	)
-	statusz.Install(proxyMux, kubeProxy, registry)
+		)
+		statusz.Install(proxyMux, "kube-proxy", registry)
 
 	}
 
