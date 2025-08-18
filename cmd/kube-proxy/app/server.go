@@ -495,7 +495,7 @@ func serveMetrics(ctx context.Context, bindAddress string, proxyMode kubeproxyco
 				"/metrics",
 			}),
 		)
-		statusz.Install(proxyMux, "kube-proxy", registry)
+		statusz.Install(proxyMux, kubeProxy, registry)
 	}
 
 	fn := func() {
