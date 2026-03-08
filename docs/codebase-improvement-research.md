@@ -1,104 +1,124 @@
-# Kubernetes Repository Improvement Research (Targeted Audit)
+# Targeted codebase improvement notes (controller-focused)
 
-## Scope and method
-This audit focused on controller/runtime paths that are both high-traffic and operationally sensitive (stateful workloads, quota control loops, and controller-manager client bootstrapping). The analysis combined:
+This document records a focused audit of controller paths that are high traffic and operationally sensitive. It is intentionally written in a Kubernetes-style engineering note format so future follow-up PRs can pick up items directly.
 
-1. Repository-wide pattern scans (e.g. `context.TODO`, `TODO/FIXME/XXX`).
-2. Manual review of concrete call paths in selected files.
-3. Prioritization by operational risk (timeouts/cancellation, testability, and stale compatibility code).
+## Context
 
-## High-priority improvement candidates
+During a quick pass across controller code, we looked for patterns that typically cause production pain over time:
+- request context not being propagated;
+- retry loops without explicit cancellation/time bounds;
+- stale compatibility comments that no longer match API reality;
+- reconciliation paths doing full work when targeted work is possible.
 
-### 1) Context propagation gaps in statefulset object operations
-**Evidence**
-- The object manager interface only accepts context on `CreatePod`, while `UpdatePod`, `DeletePod`, `CreateClaim`, and `UpdateClaim` have no context parameter. As a result, implementations call `context.TODO()` internally for API writes. (`pkg/controller/statefulset/stateful_pod_control.go`)
-- `UpdateStatefulPod` and other higher-level paths already receive `ctx`, so cancellation/deadlines are available but not propagated through all write calls. (`pkg/controller/statefulset/stateful_pod_control.go`)
+## How this was reviewed
+
+1. Repo-wide pattern scans (`context.TODO`, `TODO/FIXME/XXX`) to identify hotspots.
+2. Manual read-through of selected files in `pkg/controller/*` and `staging/src/k8s.io/controller-manager/*`.
+3. Prioritization by expected operator impact and implementation risk.
+
+## Findings and recommended follow-ups
+
+### 1. StatefulSet: incomplete context propagation in object manager writes
+**Area:** `pkg/controller/statefulset`
+
+**Observed**
+- `StatefulPodControlObjectManager` takes context for `CreatePod`, but not for `UpdatePod`, `DeletePod`, `CreateClaim`, or `UpdateClaim`.
+- The concrete implementation uses `context.TODO()` for those write operations.
 
 **Why this matters**
-- In controller shutdown or long API-server tail latency, non-propagated calls can outlive request lifetimes and make graceful termination less predictable.
+- On shutdown, API-server slowness, or cascading retries, these calls cannot participate in caller cancellation/deadline handling.
 
-**Recommended change**
-- Thread `ctx` through the full `StatefulPodControlObjectManager` interface and its call sites.
-- Replace internal `context.TODO()` in write paths with passed-in context.
+**Suggested follow-up PR**
+- Thread `ctx context.Context` through all write methods in the interface and implementations.
+- Plumb `ctx` from existing higher-level call sites (`UpdateStatefulPod`, etc.).
 
-**Expected impact**
-- Better cancellation behavior under pressure, fewer straggler writes during shutdown, and easier future observability tied to context.
+**Priority**: P0
 
 ---
 
-### 2) Dynamic controller token flow has unbounded API calls + testability gap
-**Evidence**
-- Token and service-account bootstrap paths use `context.TODO()` for `CreateToken`, `Get`, and `Create` requests. (`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder_dynamic.go`)
-- The builder stores a `clock clock.Clock`, but token expiry computation still uses `time.Now()` directly and the clock is not consumed in this file. (`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder_dynamic.go`)
+### 2. Dynamic client builder: token/SA calls are not context-bounded; clock injection is underused
+**Area:** `staging/src/k8s.io/controller-manager/pkg/clientbuilder`
+
+**Observed**
+- Token and SA bootstrap operations call API methods with `context.TODO()`.
+- `DynamicControllerClientBuilder` carries an injected clock field, but token-expiry calculations still use `time.Now()` directly.
 
 **Why this matters**
-- Missing explicit timeout/cancellation can cause retries to linger under API-server disruption.
-- Direct `time.Now()` reduces deterministic testability and makes it harder to validate clock-skew behavior.
+- Under API disruption, token-fetch retries can behave less predictably without explicit cancellation.
+- Direct wall-clock calls make skew/rotation behavior harder to test deterministically.
 
-**Recommended change**
-- Introduce context with timeout in token/SA bootstrap path and propagate it through helper functions.
-- Pass an injected clock into token source and replace direct `time.Now()` usage.
+**Suggested follow-up PR**
+- Use a context with timeout for token and service-account bootstrap paths.
+- Pass injected clock into token source and remove direct `time.Now()` in expiry calculations.
 
-**Expected impact**
-- More predictable failure envelopes during outages and easier unit testing of token-rotation timing.
+**Priority**: P0
 
 ---
 
-### 3) Error wrapping consistency in token acquisition path
-**Evidence**
-- Error returns in token flow use `%v` rather than `%w`, e.g. `fmt.Errorf("failed to get token ...: %v", err)`. (`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder_dynamic.go`)
+### 3. Dynamic client builder: error wrapping can preserve richer error chains
+**Area:** `staging/src/k8s.io/controller-manager/pkg/clientbuilder`
+
+**Observed**
+- Some wrapping uses `%v` where `%w` would preserve unwrap semantics.
 
 **Why this matters**
-- `%w` preserves unwrap semantics for upstream classification (`errors.Is/As`), improving diagnostics and future refactors.
+- Better `errors.Is` / `errors.As` behavior improves debugging and future refactors.
 
-**Recommended change**
-- Replace `%v` with `%w` where wrapping source errors.
-- Keep user-facing messages stable while preserving machine-parseable error chains.
+**Suggested follow-up PR**
+- Update wrapped returns to use `%w` where appropriate.
+- Add unit assertions for unwrapping behavior where practical.
 
-**Expected impact**
-- Improved root-cause introspection and cleaner error handling in dependent callers.
+**Priority**: P1
 
 ---
 
-### 4) ResourceQuota replenishment currently does full recalculation for affected quotas
-**Evidence**
-- The controller explicitly notes that replenishment is not targeted and currently enqueues full quota recalculation when any tracked resource intersects. (`pkg/controller/resourcequota/resource_quota_controller.go`)
+### 4. ResourceQuota: replenishment path still enqueues full recalculation
+**Area:** `pkg/controller/resourcequota`
+
+**Observed**
+- Replenishment currently enqueues quota recalculation broadly when resources intersect, with a TODO noting lack of targeted behavior.
 
 **Why this matters**
-- On large namespaces and high churn resources, full recalculation can increase controller CPU and API pressure.
+- In large namespaces/high churn, full recalculation can add avoidable controller and API pressure.
 
-**Recommended change**
-- Add targeted replenishment metadata to queue items (e.g., affected `GroupResource` / evaluator hint).
-- Let sync path short-circuit evaluators not affected by triggering event.
+**Suggested follow-up PR**
+- Carry triggering resource metadata through queue items.
+- Allow evaluation path to skip unaffected evaluators/resources.
 
-**Expected impact**
-- Lower steady-state reconciliation cost and better latency under bursty updates.
+**Priority**: P1
 
 ---
 
-### 5) Stale TODO lifecycle signal in deployment rollback compatibility path
-**Evidence**
-- Rollback helper functions still carry TODO comments tied to dropping `extensions/v1beta1` and `apps/v1beta1`, which are long gone from served APIs. (`pkg/controller/deployment/rollback.go`)
+### 5. Deployment rollback helpers: TODO wording appears stale
+**Area:** `pkg/controller/deployment`
+
+**Observed**
+- Comments still reference removal conditions tied to API versions removed long ago.
 
 **Why this matters**
-- Stale TODOs make ownership/intent unclear and can hide whether compatibility behavior is still required.
+- Stale TODOs reduce signal quality for maintainers and reviewers.
 
-**Recommended change**
-- Replace legacy TODO phrasing with current rationale (e.g., annotation backward compatibility contract), or link to an active issue/KEP that tracks removal criteria.
+**Suggested follow-up PR**
+- Replace TODO wording with explicit current compatibility rationale (or link to active tracking issue if removal is still planned).
 
-**Expected impact**
-- Cleaner maintenance signals and reduced cognitive overhead during controller changes.
+**Priority**: P2
 
-## Prioritized execution plan
-1. **P0:** Context propagation for statefulset object manager write calls.
-2. **P0:** Context timeout + injected clock adoption in dynamic clientbuilder token flow.
-3. **P1:** `%w` error wrapping sweep in dynamic clientbuilder.
-4. **P1:** Targeted replenishment design/prototype for ResourceQuota controller.
-5. **P2:** Refresh stale TODO language in deployment rollback helpers.
+## Proposed execution order
 
-## Suggested validation strategy
-- Unit tests for context cancellation on statefulset update/delete/claim operations.
-- Unit tests for token expiry math with fake clock injection.
-- Error unwrap assertions for wrapped token errors.
-- Benchmark/pprof comparison for ResourceQuota sync before and after targeted replenishment.
-- Small doc/test update validating rollback annotation compatibility intent.
+1. **P0**: StatefulSet context propagation.
+2. **P0**: Dynamic builder context/time-bound token flow + clock cleanup.
+3. **P1**: Error wrapping consistency (`%w`).
+4. **P1**: ResourceQuota targeted replenishment design and incremental implementation.
+5. **P2**: Rollback TODO refresh.
+
+## Validation guidance for implementation PRs
+
+- Unit tests covering context cancellation for StatefulSet pod/PVC write calls.
+- Unit tests for token expiry/rotation math using fake clock.
+- Error chain tests (`errors.Is/As`) where wrapping changes are introduced.
+- Benchmark or pprof comparison for ResourceQuota sync behavior before/after targeted replenishment.
+
+## Non-goals for this document
+
+- This note does **not** change behavior.
+- It is not a KEP; it is a focused engineering backlog artifact to make follow-up PRs faster and better scoped.
